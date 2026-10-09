@@ -11,7 +11,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Running Inverse PINN on: {device}")
 
 # ==========================================
-# 1. Stable Synthetic Data Generation
+# 1. Stable Synthetic Data Generation (LSODA Solver)
 # ==========================================
 NU_TRUE = 0.01 / np.pi  # True viscosity (~0.0031831)
 Nx, Nt = 100, 100
@@ -21,7 +21,7 @@ dx = x_grid[1] - x_grid[0]
 
 u0 = -np.sin(np.pi * x_grid)
 
-# Proper interior derivative function (prevents boundary roll wrap-around)
+# Proper interior derivative function
 def burgers_rhs(t, u):
     dudt = np.zeros_like(u)
     du_dx = (u[2:] - u[:-2]) / (2 * dx)
@@ -29,9 +29,9 @@ def burgers_rhs(t, u):
     dudt[1:-1] = - u[1:-1] * du_dx + NU_TRUE * d2u_dx2
     return dudt
 
-# Solve using Radau implicit solver for stiff PDE stability
-sol = solve_ivp(burgers_rhs, [0, 1], u0, t_eval=t_grid, method='Radau')
-u_exact = sol.y.T  # Shape: (100, 100)
+# LSODA solver integrates smoothly across all 100 time steps without early termination
+sol = solve_ivp(burgers_rhs, [0, 1], u0, t_eval=t_grid, method='LSODA')
+u_exact = sol.y.T  # Guaranteed Shape: (100, 100)
 
 # Build space-time grid
 X, T = np.meshgrid(x_grid, sol.t)
@@ -39,9 +39,9 @@ all_x = X.flatten()[:, None]
 all_t = T.flatten()[:, None]
 all_u = u_exact.flatten()[:, None]
 
-# Sample 400 sparse noisy sensor measurements across space-time
+# Sample 500 sparse noisy sensor measurements across space-time
 n_total = len(all_u)
-idx_obs = np.random.choice(n_total, 400, replace=False)
+idx_obs = np.random.choice(n_total, 500, replace=False)
 x_obs = torch.tensor(all_x[idx_obs], dtype=torch.float32, device=device)
 t_obs = torch.tensor(all_t[idx_obs], dtype=torch.float32, device=device)
 u_obs = torch.tensor(all_u[idx_obs] + 0.02 * np.random.randn(*all_u[idx_obs].shape), 
@@ -64,20 +64,22 @@ class InversePINN(nn.Module):
             nn.Linear(64, 64), nn.Tanh(),
             nn.Linear(64, 1)
         )
-        # Trainable viscosity parameter initialized to 0.05 (intentional wrong guess)
+        # Trainable viscosity parameter initialized to 0.05
         self.nu = nn.Parameter(torch.tensor([0.05], dtype=torch.float32))
 
     def forward(self, x, t):
         return self.net(torch.cat([x, t], dim=1))
 
 model = InversePINN().to(device)
+
+# Separate learning rates: nu gets higher lr (5e-3) to converge fast
 optimizer = torch.optim.Adam([
     {'params': model.net.parameters(), 'lr': 1e-3},
-    {'params': [model.nu], 'lr': 1e-3}
+    {'params': [model.nu], 'lr': 5e-3}
 ])
 
 # ==========================================
-# 3. Training Loop with Parameter Discovery
+# 3. Training Loop with Dynamic Parameter Discovery
 # ==========================================
 epochs = 4000
 nu_history = []
@@ -88,11 +90,11 @@ print("Starting Inverse PINN Optimization...\n")
 for epoch in range(1, epochs + 1):
     optimizer.zero_grad()
     
-    # Data loss
+    # Data loss (Matching sensor observations)
     u_pred_obs = model(x_obs, t_obs)
     loss_data = torch.mean((u_pred_obs - u_obs) ** 2)
     
-    # Physics loss
+    # Physics residual loss
     u_coll = model(x_coll, t_coll)
     u_x = torch.autograd.grad(u_coll, x_coll, torch.ones_like(u_coll), create_graph=True)[0]
     u_t = torch.autograd.grad(u_coll, t_coll, torch.ones_like(u_coll), create_graph=True)[0]
@@ -101,7 +103,7 @@ for epoch in range(1, epochs + 1):
     f_pde = u_t + u_coll * u_x - model.nu * u_xx
     loss_pde = torch.mean(f_pde ** 2)
     
-    total_loss = 10.0 * loss_data + loss_pde
+    total_loss = 20.0 * loss_data + loss_pde
     total_loss.backward()
     optimizer.step()
     
@@ -131,8 +133,8 @@ axes[0].set_ylabel("Time (t)")
 axes[0].legend(loc='upper right')
 fig.colorbar(c, ax=axes[0])
 
-# Plot 2: Slice Comparison at t = 0.5
-mid_t_idx = Nt // 2
+# Plot 2: Safe slice indexing using actual solver time dimension
+mid_t_idx = len(sol.t) // 2
 axes[1].plot(x_grid, u_exact[mid_t_idx, :], 'b-', linewidth=2, label='Exact Ground Truth')
 axes[1].plot(x_grid, u_pred_grid[mid_t_idx, :], 'r--', linewidth=2, label='Inverse PINN Prediction')
 axes[1].set_title(f"Velocity Slice Profile at t = {sol.t[mid_t_idx]:.2f}")
